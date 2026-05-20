@@ -1,0 +1,47 @@
+# Reference genomes and indices
+*.fa
+*.fna
+*.fasta
+*.fa.fai
+*.fna.fai
+*.dict
+*.bwt
+*.bwt.2bit.64
+*.pac
+*.sa
+*.amb
+*.ann
+*.0123
+*.img
+*.gridsscache
+
+# Large variant/annotation files
+*.vcf
+*.vcf.gz
+*.vcf.gz.tbi
+*.bed
+*.bed.gz
+*.bed.gz.tbi
+*.bedpe
+
+# Archives and containers
+*.tar
+*.sif
+*.jar
+
+# Nextflow run artifacts
+work/
+.nextflow/
+.nextflow.log*
+report.html*
+timeline.html*
+trace.txt*
+
+# Credentials — never commit
+gdc_token.txt
+
+# Misc large files
+*.tsv
+*.gz
+*.bcf
+*.bcf.csi
