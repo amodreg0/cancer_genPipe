@@ -1,157 +1,174 @@
-# cancer_genPipe
+# Somatic Variant Calling Pipeline
 
-A Nextflow (DSL1) pipeline for somatic variant calling in cancer whole-genome sequencing data. Starting from GDC BAM IDs, the pipeline downloads tumor/normal pairs, realigns them to both **GRCh38** and **T2T-CHM13v2** reference genomes, and runs somatic SNV, indel, SV, and MSI callers in parallel on both assemblies.
+A [Nextflow](https://www.nextflow.io/) (DSL1) pipeline for somatic variant calling from GDC-hosted tumor/normal BAM pairs. The pipeline supports **two reference genomes in parallel**: GRCh38 (hg38) and T2T-CHM13v2 (t2t), automatically detecting whether input BAMs need realignment and running the full preprocessing + calling stack for each genome.
 
 ---
 
-## Pipeline overview
+## Overview
 
 ```
-GDC download (tumor + normal BAM)
+GDC Download (normal + tumor BAM)
         │
-        ▼
-Reference genome detection (Detect.py)
-        │
-   ┌────┴────┐
-already    needs
-aligned  realignment
-   │         │
-   │    bwa-mem2 → MarkDuplicates → BQSR
-   │         │
-   └────┬────┘
-        │
-        ▼
-Prepare custom reference (ExpandReference.py)
-   [matches BAM contig list to avoid Strelka2 SIGSEGV]
-        │
-   ┌────┴──────────────────────┐
-   ▼                           ▼
-MSIsensor                  Manta (SV calling)
-                               │
-                               ▼
-                           Strelka2 (SNV + indel calling)
+        ├──────────────────────────────┐
+        ▼                              ▼
+  [hg38 path]                   [t2t path]
+        │                              │
+  Reference recognition          Reference recognition
+  (already aligned? → keep)     (already aligned? → keep)
+        │                              │
+  Realignment (bwa-mem2)         Realignment (bwa-mem2)
+  MarkDuplicates (GATK)          MarkDuplicates (GATK)
+  BQSR (GATK)                    BQSR (GATK)
+        │                              │
+  Prepare reference genome       Prepare reference genome
+  (expand to match BAM contigs)  (expand to match BAM contigs)
+        │                              │
+  ┌─────┼──────┐               ┌──────┼──────┐
+  ▼     ▼      ▼               ▼      ▼
+MSIsensor  Manta  Strelka2    Manta  Strelka2
 ```
 
-Both the **hg38** and **T2T** paths run in parallel with identical logic.
+---
+
+## Key Features
+
+- **Dual-genome support**: runs hg38 and T2T paths simultaneously on the same samples.
+- **Smart routing**: detects the reference genome of each downloaded BAM via `Detect.py`; only realigns if needed, otherwise passes the BAM through directly.
+- **Full preprocessing**: collate → fastq → bwa-mem2 alignment → MarkDuplicates → BQSR.
+- **Reference expansion**: builds a per-sample reference FASTA whose `@SQ` list exactly matches the BAM header (prevents Strelka2 SIGSEGV on mismatched contigs).
+- **Three callers**: MSIsensor (microsatellite instability, hg38 only), Manta (structural variants), and Strelka2 (SNVs + indels). Manta candidate indels are fed into Strelka2.
+- **Sex inference**: queries GDC metadata for the case to determine biological sex (currently commented out but wired in via `GDCRetrieveSex.py`).
 
 ---
 
 ## Requirements
 
-### Software
-- [Nextflow](https://www.nextflow.io/) ≥ 21.x (DSL1)
-- [Docker](https://www.docker.com/) or [Singularity](https://sylabs.io/) (containers used per process)
-- `bwa-mem2`
-- `samtools`
-- `GATK4`
+### Software / Containers
 
-Variant callers and other tools are pulled automatically via the containers specified in `nextflow.config`.
+| Tool | Version / Container |
+|---|---|
+| Nextflow | DSL1 |
+| GDC client | `cassisbonbon/gdcclient:v1.0` |
+| pysam | `quay.io/biocontainers/pysam:0.15.2--py38hbab3036_7` |
+| bwa-mem2 | available in the execution environment |
+| samtools | available in the execution environment |
+| GATK 4 | available in the execution environment |
+| Manta | available in the execution environment |
+| Strelka2 | available in the execution environment |
+| MSIsensor | available in the execution environment (`myenv` conda env) |
+| Prepare-reference container | `cassisbonbon/preparereferencegenome:v2.0` |
 
-### Reference files
+### Reference Files (hg38)
 
-These must be downloaded separately and placed in the pipeline working directory (or paths adjusted in the `.nf` file). They are excluded from the repository due to size.
+| File | Description |
+|---|---|
+| `GCA_000001405.15_GRCh38_no_alt_analysis_set.fna` + index files | GRCh38 reference FASTA and BWA-MEM2 indices |
+| `GRCh38.d1.vd1.fa.bed.gz` + `.tbi` | Callable regions BED |
+| `Homo_sapiens_assembly38.dbsnp138.vcf` + `.idx` | dbSNP for BQSR |
 
-#### GRCh38
-| File | Source |
-|------|--------|
-| `GCA_000001405.15_GRCh38_no_alt_analysis_set.fna` + indices (`.fai`, `.pac`, `.ann`, `.amb`, `.0123`, `.bwt.2bit.64`, `.dict`) | [NCBI / GDC reference files](https://gdc.cancer.gov/about-data/gdc-data-processing/gdc-reference-files) |
-| `Homo_sapiens_assembly38.dbsnp138.vcf` + `.idx` | [GATK resource bundle](https://gatk.broadinstitute.org/hc/en-us/articles/360035890811) |
-| `GRCh38.d1.vd1.fa.bed.gz` + `.tbi` | [GDC reference files](https://gdc.cancer.gov/about-data/gdc-data-processing/gdc-reference-files) |
+### Reference Files (T2T)
 
-#### T2T-CHM13v2
-| File | Source |
-|------|--------|
-| `hs1.fa` + indices (placed at `/g/strcombio/fsupek_decider/amodrego/genome_files/`) | [UCSC T2T-CHM13v2](https://hgdownload.soe.ucsc.edu/goldenPath/hs1/bigZips/) |
-| `chm13v2.0_dbSNPv155.vcf.gz` + `.tbi` | [NCBI dbSNP / T2T](https://ftp.ncbi.nlm.nih.gov/snp/organisms/human_9606/VCF/) |
-| `hs1.fa.bed.gz` + `.tbi` | Generated from T2T FASTA with `bedtools` |
+| File | Description |
+|---|---|
+| `hs1.fa` + index files | T2T-CHM13v2 reference FASTA and BWA-MEM2 indices |
+| `hs1.fa.d1.vd1.bed.gz` + `.tbi` | Callable regions BED |
+| `chm13v2.0_dbSNPv155.vcf.gz` + `.tbi` | dbSNP for BQSR |
 
-#### Helper scripts (included in repo)
-| File | Purpose |
-|------|---------|
-| `Detect.py` | Identifies the reference genome a BAM was aligned to |
-| `ExpandReference.py` | Builds a custom reference FASTA matching the BAM's contig list |
-| `RetrieveReadGroupInfo.py` | Extracts read group metadata from BAM header |
-| `GDCRetrieveSex.py` | Queries GDC API for patient sex |
-| `contig_mappings.txt` | Contig name translation table (UCSC ↔ Ensembl ↔ NCBI) |
-| `filter_contig_from_genref.py` | Filters contigs from reference |
-| `get_entrez_fasta.py` | Fetches FASTA sequences via Entrez |
-| `reorder_fa_seqs.py` | Reorders FASTA sequences to match BAM header |
+### GDC Token
+
+A valid GDC data access token must be present at `gdc_token.txt` in the working directory.
+
+### Helper Scripts
+
+All of the following Python scripts must be present in the working directory:
+
+| Script | Purpose |
+|---|---|
+| `Detect.py` | Determines whether a BAM is aligned to a given reference |
+| `ExpandReference.py` | Expands a base FASTA to include all contigs present in the BAM header |
+| `RetrieveReadGroupInfo.py` | Extracts read-group metadata from a BAM |
+| `GDCRetrieveSex.py` | Queries GDC API for biological sex of a case |
+| `contig_mappings.txt` | Contig name mapping table used by `ExpandReference.py` |
+| `filter_contig_from_genref.py` | Filters contigs from a genome reference |
+| `get_entrez_fasta.py` | Fetches FASTA sequences from Entrez |
+| `reorder_fa_seqs.py` | Reorders FASTA sequences |
 
 ---
 
-## Usage
-
-### Parameters
+## Parameters
 
 | Parameter | Description |
-|-----------|-------------|
-| `--normalId` | GDC file UUID for the normal BAM |
-| `--tumorId` | GDC file UUID for the tumor BAM |
-| `--caseId` | GDC case UUID (used to retrieve patient sex) |
-| `--basePublish` | Output directory for results |
+|---|---|
+| `params.normalId` | GDC UUID of the normal sample BAM |
+| `params.tumorId` | GDC UUID of the tumor sample BAM |
+| `params.caseId` | GDC case UUID (used for sex inference) |
+| `params.basePublish` | Base output directory for published results |
 
-### GDC token
-
-Place a valid GDC access token in `gdc_token.txt` in the working directory. This file is excluded from git (never commit credentials).
-
-### Run
+Example invocation:
 
 ```bash
-nextflow run NextflowPipeline2.nf \
-  --normalId  <GDC_normal_bam_uuid> \
-  --tumorId   <GDC_tumor_bam_uuid> \
-  --caseId    <GDC_case_uuid> \
-  --basePublish /path/to/output \
-  -c nextflow.config \
-  -profile <your_profile>
+nextflow run main.nf \
+  --normalId  <GDC_NORMAL_UUID> \
+  --tumorId   <GDC_TUMOR_UUID> \
+  --caseId    <GDC_CASE_UUID> \
+  --basePublish /path/to/results
 ```
 
 ---
 
 ## Outputs
 
-Results are published under `--basePublish` organised by tool and reference:
+Results are published under `params.basePublish`:
 
-```
-<basePublish>/
-├── msisensor_hg38/          # MSIsensor microsatellite instability scores
-├── manta_somatic_hg38/      # Manta somatic SVs (GRCh38)
-├── strelka_somatic_hg38/    # Strelka2 somatic SNVs + indels (GRCh38)
-├── manta_somatic_t2t/       # Manta somatic SVs (T2T-CHM13v2)
-└── strelka_somatic_t2t/     # Strelka2 somatic SNVs + indels (T2T-CHM13v2)
-```
+| Directory | Contents |
+|---|---|
+| `msisensor_hg38/` | MSIsensor output files (`output`, `output_somatic`, `output_dis`, `output_germline`) |
+| `manta_somatic_hg38/` | Manta VCFs for hg38 (`somaticSV`, `diploidSV`, `candidateSV`, `candidateSmallIndels`) |
+| `strelka_somatic_hg38/` | Strelka2 VCFs for hg38 (SNVs and indels) |
+| `manta_somatic_t2t/` | Manta VCFs for T2T |
+| `strelka_somatic_t2t/` | Strelka2 VCFs for T2T (SNVs and indels) |
 
 ---
 
-## Pipeline details
+## Pipeline Steps in Detail
 
-### Reference genome detection and routing
+### 1. GDC Download
+Downloads normal and tumor BAMs from the GDC portal using `gdc-client`. Retries up to 10 times on failure.
 
-Each downloaded BAM is inspected by `Detect.py` against the target reference dictionary. If the BAM is already aligned to the correct assembly (flag `0`), it is passed directly to the callers. Otherwise it is realigned with `bwa-mem2`.
+### 2. Reference Genome Recognition
+Runs `Detect.py` (via pysam) against both the hg38 and T2T sequence dictionaries. Returns `0` if the BAM is already aligned to that reference, or a non-zero value otherwise. This determines the routing decision for each sample.
 
-### Realignment
+### 3. Routing
+BAMs are split into two branches:
+- **`keep`** (`isGRCh38 == '0'`): already aligned → passed directly to downstream processes.
+- **`realign`** (`isGRCh38 != '0'`): needs realignment → sent to the realignment process.
 
-1. **Sort by name** → extract FASTQ pairs with `samtools fastq`
-2. **Align** with `bwa-mem2 mem`
-3. **Mark duplicates** with `GATK MarkDuplicates`
-4. **Base quality score recalibration** with `GATK BaseRecalibrator` + `ApplyBQSR` using dbSNP as known sites
+### 4. Realignment
+For BAMs that need realignment:
+1. `samtools collate` + `samtools fastq` to extract reads (hg38 uses streaming collate; T2T uses `samtools sort -n` then fastq to handle paired-end extraction more robustly).
+2. `bwa-mem2 mem` alignment with read-group tags injected via `samtools addreplacerg`.
+3. `awk` adds assembly (`AS:`) and species (`SP:`) tags to `@SQ` lines.
+4. `gatk MarkDuplicates` removes PCR duplicates.
+5. `gatk BaseRecalibrator` + `gatk ApplyBQSR` for base quality score recalibration.
+6. `samtools index` to produce the `.bai` index.
 
-### Custom reference preparation (`prepare_reference_genome`)
+### 5. Prepare Reference Genome
+Runs `ExpandReference.py` to build a sample-specific reference FASTA that includes every contig named in the BAM header (fetching missing sequences via Entrez if needed). This is critical: without it, Strelka2 crashes with a segfault (`SIGSEGV`) when the BAM header references contigs absent from the `.fai`.
 
-Strelka2 requires the reference FASTA `@SQ` list to exactly match the BAM header. `ExpandReference.py` builds a per-BAM reference by fetching any missing contigs from Entrez and reordering sequences to match the BAM header, preventing `SIGSEGV` crashes on non-standard contigs (decoys, alts, EBV, etc.).
+### 6. MSIsensor (hg38 only)
+Scans the reference for microsatellite sites, then scores microsatellite instability from the normal/tumor BAM pair.
 
-### Variant calling
+### 7. Manta
+Calls somatic structural variants. Configured with `--callRegions` to restrict to callable regions. Outputs candidate small indels that are passed to Strelka2.
 
-| Tool | Variant types | Notes |
-|------|--------------|-------|
-| [MSIsensor](https://github.com/ding-lab/msisensor) | Microsatellite instability | hg38 only |
-| [Manta](https://github.com/Illumina/manta) | Structural variants | Provides indel candidates to Strelka2 |
-| [Strelka2](https://github.com/Illumina/strelka) | SNVs, small indels | Uses Manta candidate indels |
+### 8. Strelka2
+Calls somatic SNVs and small indels, using Manta's candidate indels to improve sensitivity. Configured with `--reportEVSFeatures` for empirical variant scoring.
 
 ---
 
 ## Notes
 
-- T2T reference FASTA files are stored at an absolute path on the cluster (`/g/strcombio/fsupek_decider/amodrego/genome_files/`) and are not downloaded by the pipeline. Adjust this path in `NextflowPipeline2.nf` if running on a different system.
-- `gdc_token.txt` is required for GDC downloads but must never be committed to version control.
-- This pipeline uses **Nextflow DSL1**. It is not compatible with DSL2 without refactoring.
+- The pipeline is written in **Nextflow DSL1**. It is not compatible with DSL2 syntax without refactoring.
+- The `params.sex` parameter exists in the code (commented out) but sex is currently inferred dynamically via GDC metadata.
+- The T2T realignment processes include the BAI file as an explicit input (unlike hg38), since some tools require it to be co-located with the BAM.
+- Temporary directories for collate, sort, and MarkDuplicates are created locally within the task work directory and cleaned up at the end of each realignment process.
